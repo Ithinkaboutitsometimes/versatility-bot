@@ -1,5 +1,6 @@
 """
-Versatility bot v2
+Versatility bot v3
+- Settings saved in Supabase (survives Render restarts). Falls back to data.json if Supabase is not set.
 - Server stats: /stats, plus a voice channel whose name shows live counts
 - NQN: swaps :emoji: and <:emoji:id> for emojis from other servers via a webhook
 - Tickets: a panel in ONE chosen channel; each ticket is a thread in that channel
@@ -14,6 +15,7 @@ import os
 import re
 from collections import defaultdict, deque
 
+import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
@@ -28,6 +30,9 @@ NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 PORT = int(os.getenv("PORT", "10000"))
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
 BASE_RULES = (
     "You are running inside a Discord server. Messages are short and casual. "
@@ -64,22 +69,60 @@ if os.getenv("AI_SYSTEM_PROMPT"):  # optional override from Render
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("versatility")
 
-
 # ---------------------------------------------------------------- storage
-def load_data():
+data = {"guilds": {}, "modmail": {}}
+
+
+def sb_headers():
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+async def load_data():
+    """Load all settings once at startup."""
+    global data
+    if USE_SUPABASE:
+        url = f"{SUPABASE_URL}/rest/v1/bot_store?id=eq.main&select=value"
+        async with bot.session.get(url, headers=sb_headers()) as r:
+            if r.status >= 300:
+                raise RuntimeError(f"Supabase load failed: {r.status} {await r.text()}")
+            rows = await r.json()
+        if rows:
+            data = rows[0]["value"]
+    else:
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            pass
+    data.setdefault("guilds", {})
+    data.setdefault("modmail", {})
+    log.info("Settings loaded (%s): %d servers configured",
+             "Supabase" if USE_SUPABASE else "local file", len(data["guilds"]))
+
+
+async def _push(payload: str):
+    headers = {**sb_headers(), "Prefer": "resolution=merge-duplicates"}
+    body = [{"id": "main", "value": json.loads(payload)}]
     try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"guilds": {}, "modmail": {}}
+        async with bot.session.post(f"{SUPABASE_URL}/rest/v1/bot_store", headers=headers, json=body) as r:
+            if r.status >= 300:
+                log.error("Saving settings failed: %s %s", r.status, await r.text())
+    except aiohttp.ClientError as e:
+        log.error("Saving settings failed: %s", e)
 
 
 def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-data = load_data()
+    """Call from async code. Saves in the background so commands stay fast."""
+    payload = json.dumps(data)
+    if USE_SUPABASE:
+        asyncio.get_running_loop().create_task(_push(payload))
+    else:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            f.write(payload)
 
 
 def gcfg(guild_id: int) -> dict:
@@ -101,14 +144,22 @@ class VersatilityBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.ai = AsyncOpenAI(base_url=NVIDIA_BASE_URL, api_key=NVIDIA_KEY)
         self.history = defaultdict(lambda: deque(maxlen=12))
+        self.session: aiohttp.ClientSession | None = None
 
     async def setup_hook(self):
+        self.session = aiohttp.ClientSession()
+        await load_data()
         self.add_view(TicketPanelView())   # buttons keep working after restarts
         self.add_view(TicketCloseView())
         await start_web()
         update_stat_channels.start()
         await self.tree.sync()
         log.info("Slash commands synced")
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+        await super().close()
 
 
 bot = VersatilityBot()
@@ -125,7 +176,7 @@ async def start_web():
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s (%s)", bot.user, bot.user.id)
+    log.info("Logged in as %s (%s), in %d servers", bot.user, bot.user.id, len(bot.guilds))
 
 
 @bot.tree.error
@@ -225,7 +276,7 @@ async def stats_channel(
 
 
 # ---------------------------------------------------------------- NQN (emoji for non-Nitro)
-# Matches :name:   or   <:name:id>   or   <a:name:id>
+# Matches <:name:id> or <a:name:id>  OR  :name:
 EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]{2,32}):(\d+)>|:([A-Za-z0-9_]{2,32}):")
 
 
@@ -247,6 +298,7 @@ async def handle_nqn(message: discord.Message) -> bool:
         return False
     me = message.guild.me
     if not (me.guild_permissions.manage_webhooks and me.guild_permissions.manage_messages):
+        log.info("NQN skipped in %s: bot lacks Manage Webhooks or Manage Messages", message.guild.name)
         return False
     if not message.content or ":" not in message.content:
         return False
@@ -257,15 +309,16 @@ async def handle_nqn(message: discord.Message) -> bool:
     def swap(match: re.Match) -> str:
         nonlocal changed
         raw_name, raw_id, text_name = match.group(1), match.group(2), match.group(3)
-        if raw_id:  # already a pasted <:name:id> form
+        if raw_id:  # pasted <:name:id> form
             emoji = bot.get_emoji(int(raw_id))
             if emoji is None or emoji.guild_id == message.guild.id:
                 return match.group(0)
         else:       # plain :name: form
             if text_name in own_emoji_names:
-                return match.group(0)  # this server has it already
+                return match.group(0)
             emoji = find_external_emoji(message.guild, text_name)
             if emoji is None:
+                log.info("NQN: :%s: not found in any server the bot is in", text_name)
                 return match.group(0)
         changed = True
         return str(emoji)  # <:name:id> or <a:name:id>
@@ -304,11 +357,29 @@ async def nqn(interaction: discord.Interaction, enabled: bool):
     gcfg(interaction.guild_id)["nqn"] = enabled
     save_data()
     state = "enabled" if enabled else "disabled"
-    await interaction.response.send_message(
-        f"NQN is now {state}. The bot must be in the server that owns the emoji, "
-        "and needs Manage Webhooks and Manage Messages here.",
-        ephemeral=True,
-    )
+    await interaction.response.send_message(f"NQN is now {state}.", ephemeral=True)
+
+
+@bot.tree.command(name="nqn_check", description="Find out why NQN is or isn't working")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(emoji_name="The emoji name without colons, for example pepe")
+async def nqn_check(interaction: discord.Interaction, emoji_name: str):
+    g = interaction.guild
+    perms = g.me.guild_permissions
+    cfg = gcfg(g.id)
+    lines = [
+        f"NQN enabled: {'yes' if cfg.get('nqn') else 'NO. Run /nqn enabled:True'}",
+        f"Manage Webhooks: {'yes' if perms.manage_webhooks else 'NO'}",
+        f"Manage Messages: {'yes' if perms.manage_messages else 'NO'}",
+        f"Servers the bot is in: {len(bot.guilds)}",
+    ]
+    matches = [e for e in bot.emojis if e.name == emoji_name]
+    if not matches:
+        lines.append(f"`{emoji_name}` was not found. Invite the bot to the server that owns that emoji.")
+    for e in matches:
+        where = "this server" if e.guild_id == g.id else f"**{e.guild.name}**"
+        lines.append(f"Found `{emoji_name}` in {where}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 # ---------------------------------------------------------------- tickets
@@ -320,12 +391,14 @@ async def ticket_thread_alive(guild: discord.Guild, thread_id: int):
             thread = await bot.fetch_channel(thread_id)
         except discord.HTTPException:
             return None
-    if isinstance(thread, discord.Thread) and thread.archived:
+    if not isinstance(thread, discord.Thread):
+        return None
+    if thread.archived:
         try:
             await thread.edit(archived=False)
         except discord.HTTPException:
             return None
-    return thread if isinstance(thread, discord.Thread) else None
+    return thread
 
 
 class TicketCloseView(discord.ui.View):
@@ -362,7 +435,6 @@ class TicketPanelView(discord.ui.View):
 
         tickets = cfg.setdefault("tickets", {})
         uid = str(interaction.user.id)
-
         if uid in tickets:
             existing = await ticket_thread_alive(guild, tickets[uid])
             if existing:
@@ -374,7 +446,7 @@ class TicketPanelView(discord.ui.View):
         name = f"ticket-{interaction.user.name}"[:90]
         note = ""
         try:
-            # Private threads are the best option. They need server boost level 2.
+            # Private threads need server boost level 2
             thread = await parent.create_thread(
                 name=name,
                 type=discord.ChannelType.private_thread,
@@ -459,7 +531,7 @@ async def modmail_setup(interaction: discord.Interaction, category: discord.Cate
     gcfg(interaction.guild_id)["modmail_category"] = category.id
     save_data()
     await interaction.response.send_message(
-        "Modmail is set. Users can now DM me to reach your staff.", ephemeral=True
+        "Modmail is set. Members who share this server can now DM me.", ephemeral=True
     )
 
 
@@ -490,7 +562,9 @@ async def handle_dm(message: discord.Message):
             target_guild, target_cat = guild, guild.get_channel(cat_id)
             break
     if not isinstance(target_cat, discord.CategoryChannel):
-        return await message.channel.send("Modmail is not set up on a server we share.")
+        return await message.channel.send(
+            "Modmail isn't set up on a server we share yet. Ask the server staff to run /modmail_setup."
+        )
 
     uid = str(message.author.id)
     channel = target_guild.get_channel(data["modmail"].get(uid, 0))
